@@ -26,36 +26,36 @@ Adjust the hexagon resolution and filters to see how different parameters affect
 """)
 
 # Functions for data preparation
-def prepare_property_data(bali_gdf):
+def prepare_property_data(place_gdf):
     # Ensure the data has the right CRS
-    if bali_gdf.crs != 'EPSG:32749':
-        bali_gdf = bali_gdf.to_crs('EPSG:32749')
-    return bali_gdf
+    if place_gdf.crs != 'EPSG:32749':
+        place_gdf = place_gdf.to_crs('EPSG:32749')
+    return place_gdf
 
-def prepare_bali_boundary(bali_area_gdf):
+def prepare_place_boundary(place_area_gdf):
     # Ensure it has the right CRS
-    if bali_area_gdf.crs != 'EPSG:32749':
-        bali_area_gdf = bali_area_gdf.to_crs('EPSG:32749')
-    return bali_area_gdf
+    if place_area_gdf.crs != 'EPSG:32749':
+        place_area_gdf = place_area_gdf.to_crs('EPSG:32749')
+    return place_area_gdf
 
-# Create hexagonal grid for Bali
-def create_hexagonal_grid(bali_boundary, resolution=8):
+# Create hexagonal grid 
+def create_hexagonal_grid(place_boundary, resolution=8):
     """
     Create hexagonal grid using H3 indexing system in UTM Zone 49S (EPSG:32749)
     Resolution 8 is approximately 0.74 km² per hexagon
     
-    This function creates a grid that completely covers Bali without gaps.
+    This function creates a grid that completely covers places without gaps.
     """
     # First convert boundary to WGS84 (EPSG:4326) for H3 grid creation
     # H3 requires WGS84 coordinates
-    bali_boundary_wgs84 = bali_boundary.to_crs('EPSG:4326')
+    place_boundary_wgs84 = place_boundary.to_crs('EPSG:4326')
     
-    # Get the polygon for Bali
-    bali_polygon = bali_boundary_wgs84.unary_union
+    # Get the polygon
+    place_polygon = place_boundary_wgs84.unary_union
     
     # Buffer the boundary slightly to ensure complete coverage of edges
-    # This creates a larger polygon that extends beyond Bali's coastline
-    buffered_polygon = bali_polygon.buffer(0.02)  # Buffer by ~2km in degrees
+    # This creates a larger polygon that extends beyond coastline
+    buffered_polygon = place_polygon.buffer(0.02)  # Buffer by ~2km in degrees
     
     # Extract coordinates from the polygon
     if hasattr(buffered_polygon, 'exterior'):
@@ -129,15 +129,15 @@ def create_hexagonal_grid(bali_boundary, resolution=8):
     # Calculate original areas
     hex_gdf['orig_area_km2'] = hex_gdf.geometry.area / 1000000
     
-    # Now clip to the exact Bali boundary
-    bali_boundary_utm = bali_boundary.to_crs('EPSG:32749')
-    bali_polygon_utm = bali_boundary_utm.unary_union
+    # Now clip to the exact boundary
+    place_boundary_utm = place_boundary.to_crs('EPSG:32749')
+    place_polygon_utm = place_boundary_utm.unary_union
     
-    # Only keep cells that intersect with Bali
-    hex_gdf = hex_gdf[hex_gdf.intersects(bali_polygon_utm)]
+    # Only keep cells that intersect with the place
+    hex_gdf = hex_gdf[hex_gdf.intersects(place_polygon_utm)]
     
     # Clip the hexagons to the boundary
-    hex_gdf['geometry'] = hex_gdf.geometry.intersection(bali_polygon_utm)
+    hex_gdf['geometry'] = hex_gdf.geometry.intersection(place_polygon_utm)
     
     # Recalculate areas after clipping
     hex_gdf['area_km2'] = hex_gdf.geometry.area / 1000000
@@ -260,11 +260,11 @@ def assign_color_codes(gdf, value_column, cmap_name, scheme, k):
         return gdf, None
 
 # Create interactive map with folium
-def create_interactive_map(bali_boundary, property_data, interpolated_grid, 
+def create_interactive_map(place_boundary, property_data, interpolated_grid, 
                           color_scheme="viridis", classification_scheme="Quantiles", 
                           k=5, basemap="CartoDB positron"):
     # Convert to WGS84 for web mapping
-    boundary_wgs84 = bali_boundary.to_crs('EPSG:4326')
+    boundary_wgs84 = place_boundary.to_crs('EPSG:4326')
     property_wgs84 = property_data.to_crs('EPSG:4326')
     grid_wgs84 = interpolated_grid.to_crs('EPSG:4326')
     
@@ -340,7 +340,7 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
             popup=folium.Popup(point_popup, max_width=300)
         ).add_to(point_layer)
     
-    # Add Bali boundary
+    # Add boundary
     folium.GeoJson(
         boundary_wgs84.geometry.__geo_interface__,
         style_function=lambda x: {
@@ -359,6 +359,7 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
     folium.LayerControl().add_to(m)
     
     # Add a legend
+    # Add a legend with color and price information
     if classifier:
         # Create a colormap legend
         bins = classifier.bins
@@ -366,7 +367,7 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
         
         legend_html = """
         <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000; background-color: white; 
-        padding: 10px; border-radius: 5px; border: 2px solid grey; width: 200px;">
+        padding: 10px; border-radius: 5px; border: 2px solid grey; width: 250px;">
         <h4 style="margin-top: 0; text-align: center;">Price per m² ({scheme})</h4>
         <table style="width:100%;">
         """.format(scheme=classification_scheme)
@@ -374,9 +375,9 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
         # Add each class to the legend
         for i in range(len(bins)):
             if i == 0:
-                label = f"< {bins[i]:.2f}"
+                label = f"< {bins[i]:,.0f}"
             else:
-                label = f"{bins[i-1]:.2f} - {bins[i]:.2f}"
+                label = f"{bins[i-1]:,.0f} - {bins[i]:,.0f}"
             
             legend_html += f"""
             <tr>
@@ -389,7 +390,7 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
         legend_html += f"""
         <tr>
             <td style="width:20px; height:20px; background-color:{colors[-1]}; border:1px solid black;"></td>
-            <td style="padding-left:10px;">> {bins[-1]:.2f}</td>
+            <td style="padding-left:10px;">> {bins[-1]:,.0f}</td>
         </tr>
         """
         
@@ -405,30 +406,30 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
 
 # Main application logic
 # File uploader
-bali_file = st.file_uploader("Upload property point data (GeoJSON)", type=["geojson", "json"])
-bali_area_file = st.file_uploader("Upload boundary data (GeoJSON)", type=["geojson", "json"])
+place_file = st.file_uploader("Upload property point data (GeoJSON)", type=["geojson", "json"])
+place_area_file = st.file_uploader("Upload boundary data (GeoJSON)", type=["geojson", "json"])
 
 # Only proceed if both files are uploaded
-if bali_file and bali_area_file:
+if place_file and place_area_file:
     # Save uploaded files to temporary location
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp_bali:
-        tmp_bali.write(bali_file.getvalue())
-        tmp_bali_path = tmp_bali.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp_place:
+        tmp_place.write(place_file.getvalue())
+        tmp_place_path = tmp_place.name
     
     with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp_area:
-        tmp_area.write(bali_area_file.getvalue())
+        tmp_area.write(place_area_file.getvalue())
         tmp_area_path = tmp_area.name
     
     # Load GeoDataFrames
-    bali = gpd.read_file(tmp_bali_path)
-    bali_area = gpd.read_file(tmp_area_path)
+    place = gpd.read_file(tmp_place_path)
+    place_area = gpd.read_file(tmp_area_path)
     
     # Clean up temporary files
-    os.unlink(tmp_bali_path)
+    os.unlink(tmp_place_path)
     os.unlink(tmp_area_path)
     
     # Check if the required columns exist
-    if 'hpm' not in bali.columns:
+    if 'hpm' not in place.columns:
         st.error("The property data must have an 'hpm' column (price per meter).")
     else:
         # Sidebar for filters and settings
@@ -479,10 +480,10 @@ if bali_file and bali_area_file:
         
         # Filter by Year if 'tahun' column exists
         year_filter = None
-        if 'tahun' in bali.columns:
+        if 'tahun' in place.columns:
             try:
                 # Extract years and convert to integers if needed
-                years = pd.to_numeric(bali['tahun'], errors='coerce').dropna().astype(int).unique()
+                years = pd.to_numeric(place['tahun'], errors='coerce').dropna().astype(int).unique()
                 years = sorted(years)
                 
                 # Allow selecting all years or specific years
@@ -502,8 +503,8 @@ if bali_file and bali_area_file:
         
         # Filter by Area Condition if the column exists
         condition_filter = None
-        if 'kondisi_wilayah_sekitar' in bali.columns:
-            conditions = bali['kondisi_wilayah_sekitar'].dropna().unique()
+        if 'kondisi_wilayah_sekitar' in place.columns:
+            conditions = place['kondisi_wilayah_sekitar'].dropna().unique()
             
             # Allow selecting all conditions or specific ones
             condition_filter_type = st.sidebar.radio(
@@ -523,14 +524,14 @@ if bali_file and bali_area_file:
         land_area_min_max = None
         land_area_category = None
         
-        if 'luas_tanah' in bali.columns:
+        if 'luas_tanah' in place.columns:
             try:
                 # Convert to numeric
-                bali['luas_tanah_numeric'] = pd.to_numeric(bali['luas_tanah'], errors='coerce')
+                place['luas_tanah_numeric'] = pd.to_numeric(place['luas_tanah'], errors='coerce')
                 
                 # Get min and max values
-                min_area = bali['luas_tanah_numeric'].min()
-                max_area = bali['luas_tanah_numeric'].max()
+                min_area = place['luas_tanah_numeric'].min()
+                max_area = place['luas_tanah_numeric'].max()
                 
                 # Land area filter type choice
                 land_area_filter_type = st.sidebar.radio(
@@ -557,7 +558,7 @@ if bali_file and bali_area_file:
                 st.sidebar.warning("Could not process 'luas_tanah' column as numeric values.")
         
         # Apply filters to the data
-        filtered_data = bali.copy()
+        filtered_data = place.copy()
         
         # Apply year filter if selected
         if year_filter and 'tahun' in filtered_data.columns:
@@ -602,7 +603,7 @@ if bali_file and bali_area_file:
             st.subheader("Data Summary")
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("Total Properties", len(bali))
+                st.metric("Total Properties", len(place))
                 st.metric("Filtered Properties", len(filtered_data))
                 st.write("Price per Meter (HPM) Statistics (Filtered Data):")
                 st.write(filtered_data['hpm'].describe())
@@ -644,10 +645,10 @@ if bali_file and bali_area_file:
             # Process data
             with st.spinner("Processing data... This may take a moment."):
                 property_data = prepare_property_data(filtered_data)
-                bali_boundary = prepare_bali_boundary(bali_area)
+                place_boundary = prepare_place_boundary(place_area)
                 
                 # Create hexagonal grid with user-selected resolution
-                hex_grid = create_hexagonal_grid(bali_boundary, resolution=resolution)
+                hex_grid = create_hexagonal_grid(place_boundary, resolution=resolution)
                 
                 # Perform TIN interpolation
                 interpolated_grid = perform_tin_interpolation(property_data, hex_grid)
@@ -679,7 +680,7 @@ if bali_file and bali_area_file:
                 st.subheader("Interactive Map")
                 st.info("You can toggle different layers on/off using the layer control in the top right corner of the map.")
                 m, grid_with_colors = create_interactive_map(
-                    bali_boundary, 
+                    place_boundary, 
                     property_data, 
                     interpolated_grid,
                     color_scheme=color_scheme,
@@ -729,7 +730,7 @@ if bali_file and bali_area_file:
                     st.download_button(
                         label="Download Interpolated Values (CSV)",
                         data=csv_data,
-                        file_name=f"bali_interpolated_values_h3res{resolution}.csv",
+                        file_name=f"place_interpolated_values_h3res{resolution}.csv",
                         mime="text/csv"
                     )
                 
@@ -747,7 +748,7 @@ if bali_file and bali_area_file:
                     st.download_button(
                         label="Download Filtered Property Data (GeoJSON)",
                         data=filtered_data_download,
-                        file_name=f"bali_filtered_properties.geojson",
+                        file_name=f"place_filtered_properties.geojson",
                         mime="application/json"
                     )
                 
@@ -756,7 +757,7 @@ if bali_file and bali_area_file:
                     st.download_button(
                         label="Download Filtered Property Data (CSV)",
                         data=filtered_csv,
-                        file_name=f"bali_filtered_properties.csv",
+                        file_name=f"place_filtered_properties.csv",
                         mime="text/csv"
                     )
 else:
