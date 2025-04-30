@@ -14,7 +14,7 @@ import tempfile
 import os
 
 st.set_page_config(
-    page_title="Bali Property Price Interpolation",
+    page_title="Property Price Hexagrid",
     page_icon="🏝️",
     layout="wide"
 )
@@ -760,12 +760,12 @@ if bali_file and bali_area_file:
                         mime="text/csv"
                     )
 else:
-    st.info("Please upload both the Bali property point data and Bali boundary files to continue.")
+    st.info("Please upload both the property point data and boundary files to continue.")
     
-    # Show placeholder/demo image
-    st.subheader("Example Visualization")
-    st.image("https://storage.googleapis.com/kaggle-datasets-images/1862783/3101200/42e0af8ca2cbe5fd0bdfab77d13f7b3e/dataset-card.png", 
-             caption="Example of hexagonal grid visualization (placeholder)")
+    # # Show placeholder/demo image
+    # st.subheader("Example Visualization")
+    # st.image("https://storage.googleapis.com/kaggle-datasets-images/1862783/3101200/42e0af8ca2cbe5fd0bdfab77d13f7b3e/dataset-card.png", 
+    #          caption="Example of hexagonal grid visualization (placeholder)")
     
     # Add information about hexagon sizes
     st.subheader("H3 Hexagon Size Reference")
