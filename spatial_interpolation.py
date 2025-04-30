@@ -1,0 +1,780 @@
+import streamlit as st
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from shapely.geometry import Point, Polygon
+import matplotlib.pyplot as plt
+import folium
+from streamlit_folium import folium_static
+from scipy.spatial import Delaunay
+import h3
+import matplotlib.colors as mcolors
+from osgeo import gdal, ogr, osr
+import tempfile
+import os
+
+st.set_page_config(
+    page_title="Bali Property Price Interpolation",
+    page_icon="🏝️",
+    layout="wide"
+)
+
+st.title("Bali Property Price TIN Interpolation")
+st.markdown("""
+This app performs TIN (Triangulated Irregular Network) interpolation on property price data in Bali.
+Adjust the hexagon resolution and filters to see how different parameters affect the visualization.
+""")
+
+# Functions for data preparation
+def prepare_property_data(bali_gdf):
+    # Ensure the data has the right CRS
+    if bali_gdf.crs != 'EPSG:32749':
+        bali_gdf = bali_gdf.to_crs('EPSG:32749')
+    return bali_gdf
+
+def prepare_bali_boundary(bali_area_gdf):
+    # Ensure it has the right CRS
+    if bali_area_gdf.crs != 'EPSG:32749':
+        bali_area_gdf = bali_area_gdf.to_crs('EPSG:32749')
+    return bali_area_gdf
+
+# Create hexagonal grid for Bali
+def create_hexagonal_grid(bali_boundary, resolution=8):
+    """
+    Create hexagonal grid using H3 indexing system in UTM Zone 49S (EPSG:32749)
+    Resolution 8 is approximately 0.74 km² per hexagon
+    
+    This function creates a grid that completely covers Bali without gaps.
+    """
+    # First convert boundary to WGS84 (EPSG:4326) for H3 grid creation
+    # H3 requires WGS84 coordinates
+    bali_boundary_wgs84 = bali_boundary.to_crs('EPSG:4326')
+    
+    # Get the polygon for Bali
+    bali_polygon = bali_boundary_wgs84.unary_union
+    
+    # Buffer the boundary slightly to ensure complete coverage of edges
+    # This creates a larger polygon that extends beyond Bali's coastline
+    buffered_polygon = bali_polygon.buffer(0.02)  # Buffer by ~2km in degrees
+    
+    # Extract coordinates from the polygon
+    if hasattr(buffered_polygon, 'exterior'):
+        # Single polygon
+        exterior_coords = list(buffered_polygon.exterior.coords)
+        holes = [list(interior.coords) for interior in buffered_polygon.interiors]
+    else:
+        # MultiPolygon - take the largest one for simplicity
+        largest_poly = max(buffered_polygon.geoms, key=lambda p: p.area)
+        exterior_coords = list(largest_poly.exterior.coords)
+        holes = [list(interior.coords) for interior in largest_poly.interiors]
+    
+    # Prepare polygon in the format H3 expects (list of [lng, lat] pairs)
+    h3_polygon = [[(lng, lat) for lng, lat in exterior_coords]]
+    for hole in holes:
+        h3_polygon.append([(lng, lat) for lng, lat in hole])
+    
+    # Generate a dense grid of points to ensure no gaps
+    # This approach ensures complete coverage by sampling many points
+    min_lng = min(coord[0] for coord in exterior_coords)
+    max_lng = max(coord[0] for coord in exterior_coords)
+    min_lat = min(coord[1] for coord in exterior_coords)
+    max_lat = max(coord[1] for coord in exterior_coords)
+    
+    # Use a much denser grid than before
+    lat_step = 0.001  # Approximately 100m
+    lng_step = 0.001
+    
+    # Create a set to store unique H3 cell IDs
+    hex_ids = set()
+    
+    # Generate points in a grid pattern
+    for lat in np.arange(min_lat, max_lat, lat_step):
+        for lng in np.arange(min_lng, max_lng, lng_step):
+            # Check if the point is inside or near the buffered polygon
+            point = Point(lng, lat)
+            if buffered_polygon.contains(point):
+                # Get the H3 cell containing this point
+                cell_id = h3.latlng_to_cell(lat, lng, resolution)
+                hex_ids.add(cell_id)
+    
+    # Get the ring of cells surrounding our existing cells to ensure no gaps
+    all_cells = set(hex_ids)
+    for cell_id in hex_ids:
+        # Get the neighbors (ring 1) of each cell
+        neighbors = h3.grid_ring(cell_id, 1)
+        all_cells.update(neighbors)
+    
+    # Convert cell IDs to polygons
+    hex_polygons = []
+    hex_indices = []
+    
+    for cell_id in all_cells:
+        # Get boundary vertices (lat, lng pairs)
+        boundary = h3.cell_to_boundary(cell_id)
+        # Convert to Shapely polygon (lng, lat format)
+        polygon = Polygon([(lng, lat) for lat, lng in boundary])
+        hex_polygons.append(polygon)
+        hex_indices.append(cell_id)
+    
+    # Create GeoDataFrame
+    hex_gdf = gpd.GeoDataFrame(
+        {'h3_index': hex_indices},
+        geometry=hex_polygons,
+        crs='EPSG:4326'
+    )
+    
+    # Transform to UTM
+    hex_gdf = hex_gdf.to_crs('EPSG:32749')
+    
+    # Calculate original areas
+    hex_gdf['orig_area_km2'] = hex_gdf.geometry.area / 1000000
+    
+    # Now clip to the exact Bali boundary
+    bali_boundary_utm = bali_boundary.to_crs('EPSG:32749')
+    bali_polygon_utm = bali_boundary_utm.unary_union
+    
+    # Only keep cells that intersect with Bali
+    hex_gdf = hex_gdf[hex_gdf.intersects(bali_polygon_utm)]
+    
+    # Clip the hexagons to the boundary
+    hex_gdf['geometry'] = hex_gdf.geometry.intersection(bali_polygon_utm)
+    
+    # Recalculate areas after clipping
+    hex_gdf['area_km2'] = hex_gdf.geometry.area / 1000000
+    
+    # Remove tiny fragments
+    hex_gdf = hex_gdf[hex_gdf.area_km2 > 0.00001]
+    
+    # Reset index
+    hex_gdf = hex_gdf.reset_index(drop=True)
+    
+    return hex_gdf
+
+# Perform TIN interpolation using Delaunay triangulation
+def perform_tin_interpolation(property_data, hex_grid):
+    # Extract points and values
+    points = np.array([(point.x, point.y) for point in property_data.geometry])
+    values = np.array(property_data['hpm'])  # Using price per meter (hpm) column
+    
+    # Create Delaunay triangulation
+    tri = Delaunay(points)
+    
+    # Get centroids of hexagons for interpolation
+    hex_centroids = hex_grid.geometry.centroid
+    target_points = np.array([(point.x, point.y) for point in hex_centroids])
+    
+    # Perform interpolation for each hexagon centroid
+    interpolated_values = []
+    
+    for point in target_points:
+        # Find the simplex (triangle) containing this point
+        simplex_idx = tri.find_simplex(point)
+        
+        if simplex_idx != -1:  # If point is inside the triangulation
+            # Get vertices of the triangle
+            triangle_vertices = tri.simplices[simplex_idx]
+            
+            # Get coordinates of triangle vertices
+            triangle_points = points[triangle_vertices]
+            
+            # Calculate barycentric coordinates
+            b = np.zeros(3)
+            for i in range(3):
+                # Create vectors
+                v0 = triangle_points[(i+1) % 3] - triangle_points[i]
+                v1 = triangle_points[(i+2) % 3] - triangle_points[i]
+                v2 = point - triangle_points[i]
+                
+                # Calculate areas using cross product
+                area_total = np.abs(np.cross(v0, v1))
+                area_sub = np.abs(np.cross(v0, v2))
+                
+                if area_total != 0:
+                    b[i] = area_sub / area_total
+                else:
+                    b[i] = 1/3  # Equal weights if degenerate triangle
+            
+            # Normalize barycentric coordinates
+            b = b / np.sum(b)
+            
+            # Interpolate using barycentric coordinates
+            interpolated_value = np.sum(values[triangle_vertices] * b)
+        else:
+            # Point is outside the triangulation, use nearest neighbor
+            distances = np.sqrt(np.sum((points - point)**2, axis=1))
+            nearest_idx = np.argmin(distances)
+            interpolated_value = values[nearest_idx]
+        
+        interpolated_values.append(interpolated_value)
+    
+    # Add interpolated values to hexagon grid
+    hex_grid['price_per_m'] = interpolated_values
+    
+    return hex_grid
+
+# Assign color codes based on values and classification scheme
+def assign_color_codes(gdf, value_column, cmap_name, scheme, k):
+    """
+    Assigns color codes to a GeoDataFrame based on a classification scheme
+    Returns the GeoDataFrame with a new 'color_code' column
+    """
+    try:
+        import mapclassify
+        
+        # Get the values to classify
+        values = gdf[value_column].values
+        
+        # Create the classification
+        classifier = mapclassify.classify(
+            y=values,
+            scheme=scheme,
+            k=k
+        )
+        
+        # Get the bin assignments (0-based)
+        bin_labels = classifier.yb
+        
+        # Create a colormap
+        cmap = plt.cm.get_cmap(cmap_name, k)
+        
+        # Assign colors based on bin assignments
+        colors = []
+        for label in bin_labels:
+            rgba = cmap(label)
+            hex_color = mcolors.rgb2hex(rgba)
+            colors.append(hex_color)
+        
+        # Add color column to the GeoDataFrame
+        gdf['color_code'] = colors
+        
+        # Also store the bin labels for reference
+        gdf['class_bin'] = bin_labels
+        
+        # Add bin edges information
+        gdf['bin_edges'] = [classifier.bins for _ in range(len(gdf))]
+        
+        return gdf, classifier
+    
+    except ImportError:
+        st.error("Please install mapclassify: pip install mapclassify")
+        return gdf, None
+
+# Create interactive map with folium
+def create_interactive_map(bali_boundary, property_data, interpolated_grid, 
+                          color_scheme="viridis", classification_scheme="Quantiles", 
+                          k=5, basemap="CartoDB positron"):
+    # Convert to WGS84 for web mapping
+    boundary_wgs84 = bali_boundary.to_crs('EPSG:4326')
+    property_wgs84 = property_data.to_crs('EPSG:4326')
+    grid_wgs84 = interpolated_grid.to_crs('EPSG:4326')
+    
+    # Apply the classification scheme and get color codes
+    grid_wgs84, classifier = assign_color_codes(
+        grid_wgs84, 
+        'price_per_m', 
+        color_scheme, 
+        classification_scheme, 
+        k
+    )
+    
+    # Create base map
+    m = folium.Map(
+        location=[grid_wgs84.geometry.centroid.y.mean(), 
+                 grid_wgs84.geometry.centroid.x.mean()],
+        zoom_start=10,
+        tiles=basemap
+    )
+    
+    # Create feature groups for each layer (so they can be toggled)
+    hexagon_layer = folium.FeatureGroup(name="Property Prices (Hexagons)")
+    point_layer = folium.FeatureGroup(name="Property Points")
+    boundary_layer = folium.FeatureGroup(name="Bali Boundary")
+    
+    # Add hexagon grid with custom colors
+    for idx, row in grid_wgs84.iterrows():
+        # Create popup content
+        popup_content = f"""
+        <b>Price per m²:</b> {row['price_per_m']:.2f}<br>
+        <b>Area:</b> {row['area_km2']:.4f} km²<br>
+        <b>H3 Index:</b> {row['h3_index']}<br>
+        <b>Color Code:</b> {row['color_code']}<br>
+        <b>Class:</b> {row['class_bin'] + 1} of {k}
+        """
+        
+        # Create polygon with tooltip and popup
+        folium.GeoJson(
+            row.geometry.__geo_interface__,
+            style_function=lambda x, color=row['color_code']: {
+                'fillColor': color,
+                'fillOpacity': 0.7,
+                'color': 'black',
+                'weight': 1
+            },
+            tooltip=f"Price: {row['price_per_m']:.2f}",
+            popup=folium.Popup(popup_content, max_width=300)
+        ).add_to(hexagon_layer)
+    
+    # Add property points
+    for idx, row in property_wgs84.iterrows():
+        # Create popup content with property details
+        point_popup = f"""
+        <b>Price per m²:</b> {row['hpm']:.2f}<br>
+        """
+        
+        # Add additional attributes if they exist
+        if 'tahun' in row:
+            point_popup += f"<b>Year:</b> {row['tahun']}<br>"
+        if 'kondisi_wilayah_sekitar' in row:
+            point_popup += f"<b>Area Condition:</b> {row['kondisi_wilayah_sekitar']}<br>"
+        if 'luas_tanah' in row:
+            point_popup += f"<b>Land Area:</b> {row['luas_tanah']} m²<br>"
+        
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=5,
+            color='red',
+            fill=True,
+            fill_color='red',
+            fill_opacity=0.7,
+            tooltip=f"HPM: {row['hpm']}",
+            popup=folium.Popup(point_popup, max_width=300)
+        ).add_to(point_layer)
+    
+    # Add Bali boundary
+    folium.GeoJson(
+        boundary_wgs84.geometry.__geo_interface__,
+        style_function=lambda x: {
+            'fillColor': 'none',
+            'color': 'black',
+            'weight': 2
+        }
+    ).add_to(boundary_layer)
+    
+    # Add all layers to the map
+    hexagon_layer.add_to(m)
+    point_layer.add_to(m)
+    boundary_layer.add_to(m)
+    
+    # Add layer control to toggle layers on/off
+    folium.LayerControl().add_to(m)
+    
+    # Add a legend
+    if classifier:
+        # Create a colormap legend
+        bins = classifier.bins
+        colors = [mcolors.rgb2hex(plt.cm.get_cmap(color_scheme, k)(i)) for i in range(k)]
+        
+        legend_html = """
+        <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000; background-color: white; 
+        padding: 10px; border-radius: 5px; border: 2px solid grey; width: 200px;">
+        <h4 style="margin-top: 0; text-align: center;">Price per m² ({scheme})</h4>
+        <table style="width:100%;">
+        """.format(scheme=classification_scheme)
+        
+        # Add each class to the legend
+        for i in range(len(bins)):
+            if i == 0:
+                label = f"< {bins[i]:.2f}"
+            else:
+                label = f"{bins[i-1]:.2f} - {bins[i]:.2f}"
+            
+            legend_html += f"""
+            <tr>
+                <td style="width:20px; height:20px; background-color:{colors[i]}; border:1px solid black;"></td>
+                <td style="padding-left:10px;">{label}</td>
+            </tr>
+            """
+        
+        # Add the highest class
+        legend_html += f"""
+        <tr>
+            <td style="width:20px; height:20px; background-color:{colors[-1]}; border:1px solid black;"></td>
+            <td style="padding-left:10px;">> {bins[-1]:.2f}</td>
+        </tr>
+        """
+        
+        legend_html += """
+        </table>
+        </div>
+        """
+        
+        # Add the legend to the map
+        m.get_root().html.add_child(folium.Element(legend_html))
+    
+    return m, grid_wgs84
+
+# Main application logic
+# File uploader
+bali_file = st.file_uploader("Upload Bali property point data (GeoJSON)", type=["geojson", "json"])
+bali_area_file = st.file_uploader("Upload Bali boundary data (GeoJSON)", type=["geojson", "json"])
+
+# Only proceed if both files are uploaded
+if bali_file and bali_area_file:
+    # Save uploaded files to temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp_bali:
+        tmp_bali.write(bali_file.getvalue())
+        tmp_bali_path = tmp_bali.name
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp_area:
+        tmp_area.write(bali_area_file.getvalue())
+        tmp_area_path = tmp_area.name
+    
+    # Load GeoDataFrames
+    bali = gpd.read_file(tmp_bali_path)
+    bali_area = gpd.read_file(tmp_area_path)
+    
+    # Clean up temporary files
+    os.unlink(tmp_bali_path)
+    os.unlink(tmp_area_path)
+    
+    # Check if the required columns exist
+    if 'hpm' not in bali.columns:
+        st.error("The property data must have an 'hpm' column (price per meter).")
+    else:
+        # Sidebar for filters and settings
+        st.sidebar.header("Settings")
+        
+        # Hexagon Resolution
+        resolution = st.sidebar.slider(
+            "Hexagon Resolution",
+            min_value=6,
+            max_value=10,
+            value=8,
+            step=1,
+            help="Resolution 6 = Large hexagons (~36.13 km²), Resolution 10 = Small hexagons (~0.015 km²)"
+        )
+        
+        # Color scheme options
+        color_scheme = st.sidebar.selectbox(
+            "Color Scheme",
+            options=["viridis", "plasma", "inferno", "magma", "cividis", "turbo", "YlOrRd", "YlGnBu", "RdYlBu", "RdBu"],
+            index=0
+        )
+        
+        # Classification scheme options
+        classification_scheme = st.sidebar.selectbox(
+            "Classification Scheme",
+            options=["Quantiles", "EqualInterval", "NaturalBreaks", "FisherJenks", "HeadTailBreaks", "BoxPlot", "StdMean", "MaximumBreaks"],
+            index=0
+        )
+        
+        # Number of classes
+        k_classes = st.sidebar.slider(
+            "Number of Classes (k)",
+            min_value=3,
+            max_value=10,
+            value=5,
+            step=1,
+            help="Number of color classes to use in the visualization"
+        )
+        
+        basemap = st.sidebar.selectbox(
+            "Base Map",
+            options=["CartoDB positron", "OpenStreetMap", "Stamen Terrain", "CartoDB dark_matter"],
+            index=0
+        )
+        
+        # Add filters section
+        st.sidebar.header("Data Filters")
+        
+        # Filter by Year if 'tahun' column exists
+        year_filter = None
+        if 'tahun' in bali.columns:
+            try:
+                # Extract years and convert to integers if needed
+                years = pd.to_numeric(bali['tahun'], errors='coerce').dropna().astype(int).unique()
+                years = sorted(years)
+                
+                # Allow selecting all years or specific years
+                year_filter_type = st.sidebar.radio(
+                    "Filter by Year",
+                    options=["All Years", "Select Years"]
+                )
+                
+                if year_filter_type == "Select Years":
+                    year_filter = st.sidebar.multiselect(
+                        "Select Years",
+                        options=years,
+                        default=years
+                    )
+            except:
+                st.sidebar.warning("Could not process 'tahun' column as years.")
+        
+        # Filter by Area Condition if the column exists
+        condition_filter = None
+        if 'kondisi_wilayah_sekitar' in bali.columns:
+            conditions = bali['kondisi_wilayah_sekitar'].dropna().unique()
+            
+            # Allow selecting all conditions or specific ones
+            condition_filter_type = st.sidebar.radio(
+                "Filter by Area Condition",
+                options=["All Conditions", "Select Conditions"]
+            )
+            
+            if condition_filter_type == "Select Conditions":
+                condition_filter = st.sidebar.multiselect(
+                    "Select Area Conditions",
+                    options=conditions,
+                    default=conditions
+                )
+        
+        # Filter by Land Area if the column exists
+        land_area_filter_type = None
+        land_area_min_max = None
+        land_area_category = None
+        
+        if 'luas_tanah' in bali.columns:
+            try:
+                # Convert to numeric
+                bali['luas_tanah_numeric'] = pd.to_numeric(bali['luas_tanah'], errors='coerce')
+                
+                # Get min and max values
+                min_area = bali['luas_tanah_numeric'].min()
+                max_area = bali['luas_tanah_numeric'].max()
+                
+                # Land area filter type choice
+                land_area_filter_type = st.sidebar.radio(
+                    "Filter by Land Area",
+                    options=["All Land Areas", "Range Filter", "Category Filter"]
+                )
+                
+                if land_area_filter_type == "Range Filter":
+                    land_area_min_max = st.sidebar.slider(
+                        "Land Area Range (m²)",
+                        min_value=float(min_area),
+                        max_value=float(max_area),
+                        value=(float(min_area), float(max_area)),
+                        step=10.0
+                    )
+                
+                elif land_area_filter_type == "Category Filter":
+                    land_area_category = st.sidebar.multiselect(
+                        "Land Area Categories",
+                        options=["< 1,000 m²", "1,000 - 10,000 m²", "> 10,000 m²"],
+                        default=["< 1,000 m²", "1,000 - 10,000 m²", "> 10,000 m²"]
+                    )
+            except:
+                st.sidebar.warning("Could not process 'luas_tanah' column as numeric values.")
+        
+        # Apply filters to the data
+        filtered_data = bali.copy()
+        
+        # Apply year filter if selected
+        if year_filter and 'tahun' in filtered_data.columns:
+            # Convert to numeric to ensure proper filtering
+            filtered_data['tahun_numeric'] = pd.to_numeric(filtered_data['tahun'], errors='coerce')
+            filtered_data = filtered_data[filtered_data['tahun_numeric'].isin(year_filter)]
+        
+        # Apply area condition filter if selected
+        if condition_filter and 'kondisi_wilayah_sekitar' in filtered_data.columns:
+            filtered_data = filtered_data[filtered_data['kondisi_wilayah_sekitar'].isin(condition_filter)]
+        
+        # Apply land area filters if selected
+        if 'luas_tanah_numeric' in filtered_data.columns:
+            if land_area_filter_type == "Range Filter" and land_area_min_max:
+                min_val, max_val = land_area_min_max
+                filtered_data = filtered_data[
+                    (filtered_data['luas_tanah_numeric'] >= min_val) & 
+                    (filtered_data['luas_tanah_numeric'] <= max_val)
+                ]
+            
+            elif land_area_filter_type == "Category Filter" and land_area_category:
+                # Create a mask for each category
+                mask = pd.Series(False, index=filtered_data.index)
+                
+                if "< 1,000 m²" in land_area_category:
+                    mask = mask | (filtered_data['luas_tanah_numeric'] < 1000)
+                
+                if "1,000 - 10,000 m²" in land_area_category:
+                    mask = mask | ((filtered_data['luas_tanah_numeric'] >= 1000) & 
+                                  (filtered_data['luas_tanah_numeric'] <= 10000))
+                
+                if "> 10,000 m²" in land_area_category:
+                    mask = mask | (filtered_data['luas_tanah_numeric'] > 10000)
+                
+                filtered_data = filtered_data[mask]
+        
+        # Check if we still have data after filtering
+        if len(filtered_data) == 0:
+            st.error("No data remains after applying filters. Please adjust your filter settings.")
+        else:
+            # Prepare data
+            st.subheader("Data Summary")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Properties", len(bali))
+                st.metric("Filtered Properties", len(filtered_data))
+                st.write("Price per Meter (HPM) Statistics (Filtered Data):")
+                st.write(filtered_data['hpm'].describe())
+            
+            with col2:
+                if resolution == 6:
+                    hex_size = "~36.13 km²"
+                elif resolution == 7:
+                    hex_size = "~5.16 km²"
+                elif resolution == 8:
+                    hex_size = "~0.74 km²"
+                elif resolution == 9:
+                    hex_size = "~0.11 km²"
+                elif resolution == 10:
+                    hex_size = "~0.015 km²"
+                
+                st.metric("Hexagon Resolution", f"H3 Resolution {resolution} ({hex_size})")
+                st.metric("Classification Scheme", classification_scheme)
+                st.metric("Number of Classes", k_classes)
+                
+                # Display active filters
+                active_filters = []
+                if year_filter and year_filter_type == "Select Years":
+                    active_filters.append(f"Years: {', '.join(map(str, year_filter))}")
+                
+                if condition_filter and condition_filter_type == "Select Conditions":
+                    active_filters.append(f"Conditions: {', '.join(condition_filter)}")
+                
+                if land_area_filter_type == "Range Filter" and land_area_min_max:
+                    active_filters.append(f"Land Area: {land_area_min_max[0]} - {land_area_min_max[1]} m²")
+                elif land_area_filter_type == "Category Filter" and land_area_category:
+                    active_filters.append(f"Land Area Categories: {', '.join(land_area_category)}")
+                
+                if active_filters:
+                    st.markdown("**Active Filters:**")
+                    for f in active_filters:
+                        st.markdown(f"- {f}")
+            
+            # Process data
+            with st.spinner("Processing data... This may take a moment."):
+                property_data = prepare_property_data(filtered_data)
+                bali_boundary = prepare_bali_boundary(bali_area)
+                
+                # Create hexagonal grid with user-selected resolution
+                hex_grid = create_hexagonal_grid(bali_boundary, resolution=resolution)
+                
+                # Perform TIN interpolation
+                interpolated_grid = perform_tin_interpolation(property_data, hex_grid)
+                
+                # Calculate statistics
+                total_hexagons = len(hex_grid)
+                avg_area = hex_grid['area_km2'].mean()
+                
+                st.metric("Total Hexagons Generated", total_hexagons)
+                st.metric("Average Hexagon Area", f"{avg_area:.3f} km²")
+                
+                # Create quartile information
+                q1 = interpolated_grid['price_per_m'].quantile(0.25)
+                q2 = interpolated_grid['price_per_m'].quantile(0.5)
+                q3 = interpolated_grid['price_per_m'].quantile(0.75)
+                vmin = interpolated_grid['price_per_m'].min()
+                vmax = interpolated_grid['price_per_m'].max()
+                
+                # Display quartile information
+                st.subheader("Price per Meter Quartiles")
+                cols = st.columns(5)
+                cols[0].metric("Minimum", f"{vmin:.2f}")
+                cols[1].metric("Q1 (25%)", f"{q1:.2f}")
+                cols[2].metric("Median", f"{q2:.2f}")
+                cols[3].metric("Q3 (75%)", f"{q3:.2f}")
+                cols[4].metric("Maximum", f"{vmax:.2f}")
+                
+                # Create interactive map
+                st.subheader("Interactive Map")
+                st.info("You can toggle different layers on/off using the layer control in the top right corner of the map.")
+                m, grid_with_colors = create_interactive_map(
+                    bali_boundary, 
+                    property_data, 
+                    interpolated_grid,
+                    color_scheme=color_scheme,
+                    classification_scheme=classification_scheme,
+                    k=k_classes,
+                    basemap=basemap
+                )
+                
+                # Display the map
+                folium_static(m, width=1200, height=800)
+                
+                # Add color legend explanation
+                st.subheader("Color Classification Information")
+                st.markdown(f"""
+                The map uses the **{classification_scheme}** classification scheme with **{k_classes}** classes 
+                and the **{color_scheme}** color palette. Each hexagon is colored based on its price per meter value.
+                
+                Hover over or click on any hexagon to see its exact price value and color code.
+                """)
+                
+                # Add download buttons for the data
+                st.subheader("Download Results")
+                
+                # Create temporary files for download
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp_download:
+                    grid_with_colors.to_crs('EPSG:4326').to_file(tmp_download.name, driver='GeoJSON')
+                    with open(tmp_download.name, 'rb') as f:
+                        download_data = f.read()
+                    os.unlink(tmp_download.name)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        label="Download Interpolated Grid (GeoJSON)",
+                        data=download_data,
+                        file_name=f"bali_interpolated_grid_h3res{resolution}.geojson",
+                        mime="application/json"
+                    )
+                
+                with col2:
+                    # Create a CSV with hexagon ID, price, and color code
+                    if 'color_code' in grid_with_colors.columns:
+                        csv_data = grid_with_colors[['h3_index', 'price_per_m', 'area_km2', 'color_code', 'class_bin']].to_csv(index=False)
+                    else:
+                        csv_data = grid_with_colors[['h3_index', 'price_per_m', 'area_km2']].to_csv(index=False)
+                        
+                    st.download_button(
+                        label="Download Interpolated Values (CSV)",
+                        data=csv_data,
+                        file_name=f"bali_interpolated_values_h3res{resolution}.csv",
+                        mime="text/csv"
+                    )
+                
+                # Download filtered data
+                st.subheader("Download Filtered Data")
+                
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp_filtered:
+                    property_data.to_crs('EPSG:4326').to_file(tmp_filtered.name, driver='GeoJSON')
+                    with open(tmp_filtered.name, 'rb') as f:
+                        filtered_data_download = f.read()
+                    os.unlink(tmp_filtered.name)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        label="Download Filtered Property Data (GeoJSON)",
+                        data=filtered_data_download,
+                        file_name=f"bali_filtered_properties.geojson",
+                        mime="application/json"
+                    )
+                
+                with col2:
+                    filtered_csv = filtered_data.drop(columns=['geometry']).to_csv(index=False)
+                    st.download_button(
+                        label="Download Filtered Property Data (CSV)",
+                        data=filtered_csv,
+                        file_name=f"bali_filtered_properties.csv",
+                        mime="text/csv"
+                    )
+else:
+    st.info("Please upload both the Bali property point data and Bali boundary files to continue.")
+    
+    # Show placeholder/demo image
+    st.subheader("Example Visualization")
+    st.image("https://storage.googleapis.com/kaggle-datasets-images/1862783/3101200/42e0af8ca2cbe5fd0bdfab77d13f7b3e/dataset-card.png", 
+             caption="Example of hexagonal grid visualization (placeholder)")
+    
+    # Add information about hexagon sizes
+    st.subheader("H3 Hexagon Size Reference")
+    
+    # Create a table showing hexagon sizes
+    size_data = {
+        "Resolution": list(range(6, 11)),
+        "Avg Hex Area (km²)": ["36.13", "5.16", "0.74", "0.11", "0.015"],
+        "Approx Edge Length (m)": ["3,229", "1,220", "461", "174", "65.9"]
+    }
+    
+    st.table(pd.DataFrame(size_data))
