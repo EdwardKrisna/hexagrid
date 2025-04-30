@@ -9,4 +9,4 @@ streamlit-folium
 scipy
 h3
 matplotlib-colors
-gdal
+GDAL
