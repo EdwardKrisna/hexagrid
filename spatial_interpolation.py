@@ -19,9 +19,9 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("Bali Property Price TIN Interpolation")
+st.title("Property Price Hexagrid")
 st.markdown("""
-This app performs TIN (Triangulated Irregular Network) interpolation on property price data in Bali.
+This app performs TIN (Triangulated Irregular Network) interpolation on property price data.
 Adjust the hexagon resolution and filters to see how different parameters affect the visualization.
 """)
 
@@ -288,7 +288,7 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
     # Create feature groups for each layer (so they can be toggled)
     hexagon_layer = folium.FeatureGroup(name="Property Prices (Hexagons)")
     point_layer = folium.FeatureGroup(name="Property Points")
-    boundary_layer = folium.FeatureGroup(name="Bali Boundary")
+    boundary_layer = folium.FeatureGroup(name="Boundary")
     
     # Add hexagon grid with custom colors
     for idx, row in grid_wgs84.iterrows():
@@ -405,8 +405,8 @@ def create_interactive_map(bali_boundary, property_data, interpolated_grid,
 
 # Main application logic
 # File uploader
-bali_file = st.file_uploader("Upload Bali property point data (GeoJSON)", type=["geojson", "json"])
-bali_area_file = st.file_uploader("Upload Bali boundary data (GeoJSON)", type=["geojson", "json"])
+bali_file = st.file_uploader("Upload property point data (GeoJSON)", type=["geojson", "json"])
+bali_area_file = st.file_uploader("Upload boundary data (GeoJSON)", type=["geojson", "json"])
 
 # Only proceed if both files are uploaded
 if bali_file and bali_area_file:
@@ -715,7 +715,7 @@ if bali_file and bali_area_file:
                     st.download_button(
                         label="Download Interpolated Grid (GeoJSON)",
                         data=download_data,
-                        file_name=f"bali_interpolated_grid_h3res{resolution}.geojson",
+                        file_name=f"interpolated_grid_h3res{resolution}.geojson",
                         mime="application/json"
                     )
                 
