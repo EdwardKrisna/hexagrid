@@ -259,6 +259,26 @@ def assign_color_codes(gdf, value_column, cmap_name, scheme, k):
         st.error("Please install mapclassify: pip install mapclassify")
         return gdf, None
 
+# Function to format numbers in Indonesian Rupiah format
+def format_rupiah(value):
+    """
+    Format a number to Indonesian Rupiah format:
+    - Uses period (.) as thousand separator
+    - No decimal places
+    - Adds 'Rp' prefix
+    
+    Example: 3250000.04 -> Rp3.250.000
+    """
+    # Round to integer to remove decimal places
+    value_int = int(round(value))
+    
+    # Format with period as thousand separator
+    # We use the English locale and replace the comma with a period
+    formatted = "{:,}".format(value_int).replace(",", ".")
+    
+    # Add Rp prefix
+    return f"Rp {formatted}"
+
 # Create interactive map with folium
 def create_interactive_map(place_boundary, property_data, interpolated_grid, 
                           color_scheme="viridis", classification_scheme="Quantiles", 
@@ -294,7 +314,7 @@ def create_interactive_map(place_boundary, property_data, interpolated_grid,
     for idx, row in grid_wgs84.iterrows():
         # Create popup content
         popup_content = f"""
-        <b>Price per m²:</b> {row['price_per_m']:.2f}<br>
+        <b>Price per m²:</b> {format_rupiah(row['price_per_m'])}<br>
         <b>Area:</b> {row['area_km2']:.4f} km²<br>
         <b>H3 Index:</b> {row['h3_index']}<br>
         <b>Color Code:</b> {row['color_code']}<br>
@@ -310,7 +330,7 @@ def create_interactive_map(place_boundary, property_data, interpolated_grid,
                 'color': 'black',
                 'weight': 1
             },
-            tooltip=f"Price: {row['price_per_m']:.2f}",
+            tooltip=f"Price: {format_rupiah(row['price_per_m'])}",
             popup=folium.Popup(popup_content, max_width=300)
         ).add_to(hexagon_layer)
     
@@ -318,7 +338,7 @@ def create_interactive_map(place_boundary, property_data, interpolated_grid,
     for idx, row in property_wgs84.iterrows():
         # Create popup content with property details
         point_popup = f"""
-        <b>Price per m²:</b> {row['hpm']:.2f}<br>
+        <b>Price per m²:</b> {format_rupiah(row['hpm'])}<br>
         """
         
         # Add additional attributes if they exist
@@ -359,48 +379,29 @@ def create_interactive_map(place_boundary, property_data, interpolated_grid,
     folium.LayerControl().add_to(m)
     
     # Add a legend
-    # Add a legend with color and price information
+    # Add a discrete color legend using Folium's built-in system
     if classifier:
-        # Create a colormap legend
-        bins = classifier.bins
+        # Import branca for the colormap
+        import branca.colormap as cm
+        
+        # Get the bin edges (classification breaks)
+        bins = classifier.bins.tolist()
+        
+        # Get the exact colors used in the map
         colors = [mcolors.rgb2hex(plt.cm.get_cmap(color_scheme, k)(i)) for i in range(k)]
         
-        legend_html = """
-        <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000; background-color: white; 
-        padding: 10px; border-radius: 5px; border: 2px solid grey; width: 250px;">
-        <h4 style="margin-top: 0; text-align: center;">Price per m² ({scheme})</h4>
-        <table style="width:100%;">
-        """.format(scheme=classification_scheme)
+        # Create a StepColormap (discrete colors) instead of LinearColormap
+        # This ensures distinct color blocks rather than a gradient
+        colormap = cm.StepColormap(
+            colors=colors,
+            vmin=min(grid_wgs84['price_per_m']),
+            vmax=max(grid_wgs84['price_per_m']),
+            index=bins,  # Use the classifier bins as the index
+            caption=f"Price per m² in {format_rupiah(1)[0:2]} ({classification_scheme})"
+        )
         
-        # Add each class to the legend
-        for i in range(len(bins)):
-            if i == 0:
-                label = f"< {bins[i]:,.0f}"
-            else:
-                label = f"{bins[i-1]:,.0f} - {bins[i]:,.0f}"
-            
-            legend_html += f"""
-            <tr>
-                <td style="width:20px; height:20px; background-color:{colors[i]}; border:1px solid black;"></td>
-                <td style="padding-left:10px;">{label}</td>
-            </tr>
-            """
-        
-        # Add the highest class
-        legend_html += f"""
-        <tr>
-            <td style="width:20px; height:20px; background-color:{colors[-1]}; border:1px solid black;"></td>
-            <td style="padding-left:10px;">> {bins[-1]:,.0f}</td>
-        </tr>
-        """
-        
-        legend_html += """
-        </table>
-        </div>
-        """
-        
-        # Add the legend to the map
-        m.get_root().html.add_child(folium.Element(legend_html))
+        # Add the colormap to the map
+        colormap.add_to(m)
     
     return m, grid_wgs84
 
@@ -605,8 +606,8 @@ if place_file and place_area_file:
             with col1:
                 st.metric("Total Properties", len(place))
                 st.metric("Filtered Properties", len(filtered_data))
-                st.write("Price per Meter (HPM) Statistics (Filtered Data):")
-                st.write(filtered_data['hpm'].describe())
+                # st.write("Price per Meter (HPM) Statistics (Filtered Data):")
+                # st.write(filtered_data['hpm'].describe())
             
             with col2:
                 if resolution == 6:
@@ -670,11 +671,11 @@ if place_file and place_area_file:
                 # Display quartile information
                 st.subheader("Price per Meter Quartiles")
                 cols = st.columns(5)
-                cols[0].metric("Minimum", f"{vmin:.2f}")
-                cols[1].metric("Q1 (25%)", f"{q1:.2f}")
-                cols[2].metric("Median", f"{q2:.2f}")
-                cols[3].metric("Q3 (75%)", f"{q3:.2f}")
-                cols[4].metric("Maximum", f"{vmax:.2f}")
+                cols[0].metric("Minimum", format_rupiah(vmin))
+                cols[1].metric("Q1 (25%)", format_rupiah(q1))
+                cols[2].metric("Median", format_rupiah(q2))
+                cols[3].metric("Q3 (75%)", format_rupiah(q3))
+                cols[4].metric("Maximum", format_rupiah(vmax))
                 
                 # Create interactive map
                 st.subheader("Interactive Map")

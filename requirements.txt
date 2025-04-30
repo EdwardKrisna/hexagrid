@@ -10,5 +10,6 @@ scipy
 h3
 matplotlib-colors
 mapclassify
+branca
 # GDAL==3.10.2
 # gdal==3.10.2
