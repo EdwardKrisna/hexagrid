@@ -9,5 +9,5 @@ streamlit-folium
 scipy
 h3
 matplotlib-colors
-GDAL==3.10.2
-gdal==3.10.2
+# GDAL==3.10.2
+# gdal==3.10.2

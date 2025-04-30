@@ -9,7 +9,7 @@ from streamlit_folium import folium_static
 from scipy.spatial import Delaunay
 import h3
 import matplotlib.colors as mcolors
-from osgeo import gdal, ogr, osr
+# from osgeo import gdal, ogr, osr
 import tempfile
 import os
 
